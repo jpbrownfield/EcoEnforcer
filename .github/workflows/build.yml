@@ -2,11 +2,15 @@ name: Build EcoEnforcer
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
   workflow_dispatch: {}
   pull_request:
     branches: [main]
+
+permissions:
+  contents: write
 
 jobs:
   test:
@@ -23,6 +27,25 @@ jobs:
 
       - name: Run tests
         run: pytest --cov=eco_enforcer --cov-report=term-missing --cov-fail-under=80
+
+  # Auto-bumps a patch version tag on every push to main; the tag push below re-triggers
+  # this workflow (matching the `tags: v*` filter), and the build job's existing
+  # tag-only release step then does the actual packaging/publishing for that new tag.
+  tag:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version and push tag
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
+          tag_prefix: v
 
   build:
     needs: test
