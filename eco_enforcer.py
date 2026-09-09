@@ -619,14 +619,14 @@ class EcoEnforcerDaemon:
     def get_status_text(self) -> str:
         """Human-readable enforcement state, shown as the first line of the tray tooltip."""
         if self.paused:
-            return "Process Management Paused Manually"
+            return "EcoEnforcer Paused Manually"
         if self.power_pause_reason and self.power_override_active:
-            return "Process Management Active (Manual Override)"
+            return "EcoEnforcer Active (Manual Override)"
         if self.power_pause_reason == "power_plan":
-            return "Process Management Paused due to Power Plan"
+            return "EcoEnforcer Paused due to Power Plan"
         if self.power_pause_reason == "ac":
-            return "Process Management Paused on AC"
-        return "Process Management Active"
+            return "EcoEnforcer Paused on AC"
+        return "EcoEnforcer Active"
 
     def _get_baseline(self, pid: int) -> dict | None:
         """Returns a pid's natural priority/EcoQoS baseline, or None while still settling.
@@ -934,7 +934,7 @@ def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows sess
 
     menu = pystray.Menu(
         pystray.MenuItem(lambda item: daemon.get_status_text(), None, enabled=False),
-        pystray.MenuItem(lambda item: f"Eco Processes: {daemon.get_stats()}", None, enabled=False),
+        pystray.MenuItem(lambda item: f"Eco Mode Processes: {daemon.get_stats()}", None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(
             lambda item: "Pause" if not daemon.paused and (
@@ -953,8 +953,8 @@ def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows sess
 
     def refresh_status():
         status_text = daemon.get_status_text()
-        tray_icon.icon = icon_green if status_text.startswith("Process Management Active") else icon_yellow
-        tray_icon.title = f"{status_text}\nEco Processes: {daemon.get_stats()}"
+        tray_icon.icon = icon_green if status_text.startswith("EcoEnforcer Active") else icon_yellow
+        tray_icon.title = f"{status_text}\nEco Mode Processes: {daemon.get_stats()}"
 
     def update_tooltip():
         while daemon.running:
