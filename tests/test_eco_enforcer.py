@@ -493,10 +493,11 @@ class TestSaveSettings:
         settings_file = tmp_path / "settings.json"
         with patch("eco_enforcer.APP_DATA_DIR", tmp_path), \
              patch("eco_enforcer.SETTINGS_FILE", settings_file):
-            ee.save_settings(False, {"guid-1": True})
+            ee.save_settings(False, {"guid-1": True}, ["outlook.exe"])
         import json
         assert json.loads(settings_file.read_text(encoding="utf-8")) == {
             "disable_on_ac": False, "power_plan_enabled": {"guid-1": True},
+            "excluded_processes": ["outlook.exe"],
         }
 
     def test_swallows_write_errors(self, tmp_path):
@@ -512,30 +513,170 @@ class TestStartupRegistry:
             mock_winreg.OpenKey.return_value.__enter__.return_value = MagicMock()
             assert ee.is_startup_enabled() is True
 
-    def test_is_startup_enabled_false_when_key_missing(self):
-        with patch("eco_enforcer.winreg") as mock_winreg:
+    def test_is_startup_enabled_false_when_key_and_task_missing(self):
+        with patch("eco_enforcer.winreg") as mock_winreg, \
+             patch("eco_enforcer.subprocess") as mock_subprocess:
             mock_winreg.OpenKey.side_effect = OSError()
+            mock_subprocess.run.return_value = MagicMock(returncode=1)
             assert ee.is_startup_enabled() is False
 
-    def test_set_startup_enabled_true_writes_value(self):
-        with patch("eco_enforcer.winreg") as mock_winreg:
+    def test_is_startup_enabled_true_when_only_task_present(self):
+        # Enabled while elevated registers a Task Scheduler entry instead of the registry key.
+        with patch("eco_enforcer.winreg") as mock_winreg, \
+             patch("eco_enforcer.subprocess") as mock_subprocess:
+            mock_winreg.OpenKey.side_effect = OSError()
+            mock_subprocess.run.return_value = MagicMock(returncode=0)
+            assert ee.is_startup_enabled() is True
+
+    def test_set_startup_enabled_true_writes_value_when_not_admin(self):
+        with patch("eco_enforcer.winreg") as mock_winreg, \
+             patch("eco_enforcer.is_running_as_admin", return_value=False), \
+             patch("eco_enforcer.subprocess") as mock_subprocess:
             key = MagicMock()
             mock_winreg.OpenKey.return_value.__enter__.return_value = key
             ee.set_startup_enabled(True)
             assert key is mock_winreg.SetValueEx.call_args[0][0]
             assert mock_winreg.SetValueEx.call_args[0][1] == ee.STARTUP_VALUE_NAME
+            # Not elevated, so no scheduled task should be created; any stale one is cleaned up.
+            assert mock_subprocess.run.call_args[0][0][1] == "/Delete"
 
-    def test_set_startup_enabled_false_deletes_value(self):
-        with patch("eco_enforcer.winreg") as mock_winreg:
+    def test_set_startup_enabled_true_creates_task_when_admin(self):
+        # Elevated: use Task Scheduler (/RL HIGHEST) instead of the Run key, which
+        # always launches non-elevated regardless of how it was enabled.
+        with patch("eco_enforcer.winreg") as mock_winreg, \
+             patch("eco_enforcer.is_running_as_admin", return_value=True), \
+             patch("eco_enforcer.subprocess") as mock_subprocess:
+            key = MagicMock()
+            mock_winreg.OpenKey.return_value.__enter__.return_value = key
+            ee.set_startup_enabled(True)
+            mock_winreg.SetValueEx.assert_not_called()
+            mock_winreg.DeleteValue.assert_called_once_with(key, ee.STARTUP_VALUE_NAME)
+            create_args = mock_subprocess.run.call_args[0][0]
+            assert create_args[1] == "/Create"
+            assert "/RL" in create_args and "HIGHEST" in create_args
+
+    def test_set_startup_enabled_false_deletes_value_and_task(self):
+        with patch("eco_enforcer.winreg") as mock_winreg, \
+             patch("eco_enforcer.is_running_as_admin", return_value=False), \
+             patch("eco_enforcer.subprocess") as mock_subprocess:
             key = MagicMock()
             mock_winreg.OpenKey.return_value.__enter__.return_value = key
             ee.set_startup_enabled(False)
             mock_winreg.DeleteValue.assert_called_once_with(key, ee.STARTUP_VALUE_NAME)
+            assert mock_subprocess.run.call_args[0][0][1] == "/Delete"
 
     def test_set_startup_enabled_swallows_registry_errors(self):
-        with patch("eco_enforcer.winreg") as mock_winreg:
+        with patch("eco_enforcer.winreg") as mock_winreg, \
+             patch("eco_enforcer.is_running_as_admin", return_value=False), \
+             patch("eco_enforcer.subprocess"):
             mock_winreg.OpenKey.side_effect = OSError("access denied")
             ee.set_startup_enabled(True)  # must not raise
+
+
+class TestGetCurrentVersion:
+    def test_returns_dev_when_not_frozen(self):
+        assert ee.get_current_version() == "0.0.0-dev"
+
+    def test_reads_version_file_when_frozen(self, tmp_path):
+        (tmp_path / "version.txt").write_text("1.2.3", encoding="utf-8")
+        with patch("eco_enforcer.sys.frozen", True, create=True), \
+             patch("eco_enforcer.sys._MEIPASS", str(tmp_path), create=True):
+            assert ee.get_current_version() == "1.2.3"
+
+    def test_falls_back_when_file_missing_while_frozen(self, tmp_path):
+        with patch("eco_enforcer.sys.frozen", True, create=True), \
+             patch("eco_enforcer.sys._MEIPASS", str(tmp_path), create=True):
+            assert ee.get_current_version() == "0.0.0-dev"
+
+
+class TestParseVersion:
+    def test_parses_v_prefixed_version(self):
+        assert ee._parse_version("v1.2.3") == (1, 2, 3)
+
+    def test_parses_plain_version(self):
+        assert ee._parse_version("2.0.10") == (2, 0, 10)
+
+    def test_returns_zero_tuple_for_unparseable(self):
+        assert ee._parse_version("") == (0,)
+
+
+class TestCheckForUpdate:
+    def test_returns_none_on_network_error(self):
+        with patch("eco_enforcer.urllib.request.urlopen", side_effect=OSError("no network")):
+            assert ee.check_for_update() is None
+
+    def test_returns_none_when_not_newer(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"tag_name": "v0.1.0", "assets": []}'
+        with patch("eco_enforcer.urllib.request.urlopen", return_value=response), \
+             patch("eco_enforcer.get_current_version", return_value="0.1.0"):
+            assert ee.check_for_update() is None
+
+    def test_returns_version_and_url_when_newer(self):
+        body = (
+            b'{"tag_name": "v0.2.0", "assets": '
+            b'[{"name": "EcoEnforcer.exe", "browser_download_url": "https://example.com/EcoEnforcer.exe"}]}'
+        )
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = body
+        with patch("eco_enforcer.urllib.request.urlopen", return_value=response), \
+             patch("eco_enforcer.get_current_version", return_value="0.1.0"):
+            assert ee.check_for_update() == ("v0.2.0", "https://example.com/EcoEnforcer.exe")
+
+    def test_returns_none_when_asset_missing(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"tag_name": "v0.2.0", "assets": []}'
+        with patch("eco_enforcer.urllib.request.urlopen", return_value=response), \
+             patch("eco_enforcer.get_current_version", return_value="0.1.0"):
+            assert ee.check_for_update() is None
+
+
+class TestDownloadUpdate:
+    def test_returns_true_on_success(self, tmp_path):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.side_effect = [b"data", b""]
+        dest = tmp_path / "EcoEnforcer.new.exe"
+        with patch("eco_enforcer.urllib.request.urlopen", return_value=response):
+            assert ee._download_update("https://example.com/x.exe", dest) is True
+
+    def test_returns_false_on_error(self, tmp_path):
+        dest = tmp_path / "EcoEnforcer.new.exe"
+        with patch("eco_enforcer.urllib.request.urlopen", side_effect=OSError("boom")):
+            assert ee._download_update("https://example.com/x.exe", dest) is False
+
+
+class TestVerifyUpdateSignature:
+    def test_returns_true_when_thumbprint_matches(self, tmp_path):
+        exe = tmp_path / "x.exe"
+        result = MagicMock(stdout=ee.UPDATE_SIGNING_THUMBPRINT + "\n")
+        with patch("eco_enforcer.subprocess.run", return_value=result):
+            assert ee._verify_update_signature(exe) is True
+
+    def test_returns_false_when_thumbprint_mismatches(self, tmp_path):
+        exe = tmp_path / "x.exe"
+        result = MagicMock(stdout="DEADBEEF\n")
+        with patch("eco_enforcer.subprocess.run", return_value=result):
+            assert ee._verify_update_signature(exe) is False
+
+    def test_returns_false_on_subprocess_error(self, tmp_path):
+        exe = tmp_path / "x.exe"
+        with patch("eco_enforcer.subprocess.run", side_effect=OSError("no powershell")):
+            assert ee._verify_update_signature(exe) is False
+
+
+class TestApplyUpdate:
+    def test_writes_bat_and_launches_helper(self, tmp_path):
+        with patch("eco_enforcer.APP_DATA_DIR", tmp_path), \
+             patch("eco_enforcer.subprocess.Popen") as mock_popen:
+            ee.apply_update(tmp_path / "EcoEnforcer.new.exe")
+            bat_path = tmp_path / "update" / "apply_update.bat"
+            assert bat_path.exists()
+            assert "move /y" in bat_path.read_text(encoding="utf-8")
+            mock_popen.assert_called_once()
 
 
 class TestEcoEnforcerDaemonEnforceStep:
@@ -638,27 +779,28 @@ class TestEcoEnforcerDaemonEnforceStep:
             daemon.enforce_step()
             mock_apply.assert_not_called()
 
-    def test_gives_up_after_too_many_consecutive_overwrites(self):
+    def test_never_gives_up_on_consecutive_overwrites(self):
+        # A process that keeps resetting its own priority/EcoQoS is fought forever --
+        # no give-up threshold -- since re-applying is cheap.
         daemon = self._make_daemon()
         daemon.managed_pids[5] = ee.ThrottleTier.ECO_MAX
-        daemon.overwrite_streak[5] = ee.OVERWRITE_GIVEUP_CYCLES - 1
+        daemon.overwrite_streak[5] = ee.OVERWRITE_LOG_INTERVAL_CYCLES * 5
         with patch("eco_enforcer.get_foreground_pid", return_value=99), \
              patch("eco_enforcer.get_active_audio_pids", return_value=set()), \
              patch("eco_enforcer.get_visible_window_pids", return_value={5}), \
              patch("eco_enforcer.is_protected", return_value=False), \
              patch("eco_enforcer.apply_throttle_tier", return_value=True) as mock_apply:
-            # One more overwrite reaches the give-up threshold.
             daemon.enforce_step()
             mock_apply.assert_called_once_with(5, ee.ThrottleTier.ECO_MAX, {})
             mock_apply.reset_mock()
-            # The next cycle should stop re-enforcing entirely.
+            # Still re-enforced on the next cycle, no matter how long the streak is.
             daemon.enforce_step()
-            mock_apply.assert_not_called()
+            mock_apply.assert_called_once_with(5, ee.ThrottleTier.ECO_MAX, {})
 
     def test_overwrite_streak_resets_on_real_transition(self):
         daemon = self._make_daemon()
         daemon.managed_pids[5] = ee.ThrottleTier.ECO_MAX
-        daemon.overwrite_streak[5] = ee.OVERWRITE_GIVEUP_CYCLES
+        daemon.overwrite_streak[5] = ee.OVERWRITE_LOG_INTERVAL_CYCLES
         with patch("eco_enforcer.get_foreground_pid", return_value=5), \
              patch("eco_enforcer.get_active_audio_pids", return_value=set()), \
              patch("eco_enforcer.get_visible_window_pids", return_value={5}), \
@@ -990,6 +1132,116 @@ class TestManageBackgroundProcesses:
         daemon = ee.EcoEnforcerDaemon()
         with patch("eco_enforcer.psutil.process_iter", side_effect=OSError("boom")):
             daemon._manage_background_processes()  # should not raise
+
+
+class TestGetFriendlyName:
+    def test_returns_none_when_no_version_dll(self):
+        with patch("eco_enforcer.version_dll", None):
+            assert ee.get_friendly_name("C:\\some\\app.exe") is None
+
+    def test_returns_none_for_empty_path(self):
+        assert ee.get_friendly_name("") is None
+
+    def test_returns_none_when_no_version_info(self):
+        with patch("eco_enforcer.version_dll") as mock_version:
+            mock_version.GetFileVersionInfoSizeW.return_value = 0
+            assert ee.get_friendly_name("C:\\some\\app.exe") is None
+
+    def test_returns_description_on_success(self):
+        # Buffers must stay alive for the whole call, since VerQueryValueW just hands back
+        # pointers into memory the caller owns.
+        trans_buf = (ctypes.c_uint16 * 2)(0x0409, 0x04B0)
+        desc_buf = ctypes.create_unicode_buffer("Some Friendly App")
+
+        def fake_query(buf, subblock, ptr_out, len_out):
+            if subblock == "\\VarFileInfo\\Translation":
+                ptr_out._obj.value = ctypes.cast(trans_buf, ctypes.c_void_p).value
+                len_out._obj.value = 4
+            else:
+                ptr_out._obj.value = ctypes.cast(desc_buf, ctypes.c_void_p).value
+                len_out._obj.value = len(desc_buf.value) + 1
+            return True
+
+        with patch("eco_enforcer.version_dll") as mock_version:
+            mock_version.GetFileVersionInfoSizeW.return_value = 128
+            mock_version.GetFileVersionInfoW.return_value = True
+            mock_version.VerQueryValueW.side_effect = fake_query
+            assert ee.get_friendly_name("C:\\some\\app.exe") == "Some Friendly App"
+
+
+class TestGetWorkArea:
+    def test_returns_none_when_no_user32(self):
+        with patch("eco_enforcer.user32", None):
+            assert ee.get_work_area() is None
+
+    def test_returns_none_when_call_fails(self):
+        with patch("eco_enforcer.user32") as mock_user32:
+            mock_user32.SystemParametersInfoW.return_value = False
+            assert ee.get_work_area() is None
+
+    def test_returns_rect_on_success(self):
+        def fake_spi(action, param, rect_ptr, win_ini):
+            rect_ptr._obj.left = 0
+            rect_ptr._obj.top = 0
+            rect_ptr._obj.right = 1920
+            rect_ptr._obj.bottom = 1040
+            return True
+
+        with patch("eco_enforcer.user32") as mock_user32:
+            mock_user32.SystemParametersInfoW.side_effect = fake_spi
+            assert ee.get_work_area() == (0, 0, 1920, 1040)
+
+    def test_returns_none_on_oserror(self):
+        with patch("eco_enforcer.user32") as mock_user32:
+            mock_user32.SystemParametersInfoW.side_effect = OSError("boom")
+            assert ee.get_work_area() is None
+
+
+class TestCollectProcessRows:
+    def _fake_proc(self, name, exe_path, cpu):
+        proc = MagicMock()
+        proc.info = {"name": name}
+        proc.exe.return_value = exe_path
+        proc.cpu_percent.return_value = cpu
+        return proc
+
+    def test_excludes_protected_and_own_process(self):
+        procs = [
+            self._fake_proc("explorer.exe", "C:\\Windows\\explorer.exe", 1.0),
+            self._fake_proc("myapp.exe", "C:\\apps\\myapp.exe", 2.0),
+        ]
+        with patch("eco_enforcer.psutil.process_iter", return_value=procs), \
+             patch("eco_enforcer.get_process_name", return_value="explorer.exe"), \
+             patch("eco_enforcer.time.sleep"), \
+             patch("eco_enforcer.get_friendly_name", return_value="My App"):
+            rows = ee.collect_process_rows()
+        assert len(rows) == 1
+        assert rows[0]["name"] == "myapp.exe"
+        assert rows[0]["friendly"] == "My App"
+
+    def test_aggregates_cpu_for_same_name_processes(self):
+        procs = [
+            self._fake_proc("teams.exe", "C:\\apps\\teams.exe", 3.0),
+            self._fake_proc("teams.exe", "C:\\apps\\teams.exe", 4.5),
+        ]
+        with patch("eco_enforcer.psutil.process_iter", return_value=procs), \
+             patch("eco_enforcer.get_process_name", return_value=None), \
+             patch("eco_enforcer.time.sleep"), \
+             patch("eco_enforcer.get_friendly_name", return_value=None):
+            rows = ee.collect_process_rows()
+        assert len(rows) == 1
+        assert rows[0]["cpu"] == 7.5
+        assert rows[0]["friendly"] == "teams.exe"  # falls back to exe name
+
+    def test_swallows_dead_processes(self):
+        vanished = MagicMock()
+        vanished.info = {"name": "ghost.exe"}
+        with patch("eco_enforcer.psutil.process_iter", return_value=[vanished]), \
+             patch("eco_enforcer.get_process_name", return_value=None), \
+             patch("eco_enforcer.time.sleep"):
+            vanished.cpu_percent.side_effect = psutil.NoSuchProcess(1)
+            rows = ee.collect_process_rows()
+        assert rows == []
 
 
 class TestCreateTrayIconImage:

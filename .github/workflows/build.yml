@@ -79,8 +79,30 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Write version file
+        shell: bash
+        run: |
+          TAG="${{ needs.tag.outputs.new_tag || github.ref_name }}"
+          echo "${TAG#v}" > version.txt
+          cat version.txt
+
       - name: Build executable
-        run: pyinstaller --onefile --noconsole --name EcoEnforcer eco_enforcer.py
+        run: pyinstaller --onefile --noconsole --name EcoEnforcer --add-data "version.txt;." eco_enforcer.py
+
+      - name: Sign executable
+        if: env.CODE_SIGN_PFX_BASE64 != ''
+        shell: pwsh
+        env:
+          CODE_SIGN_PFX_BASE64: ${{ secrets.CODE_SIGN_PFX_BASE64 }}
+          CODE_SIGN_PFX_PASSWORD: ${{ secrets.CODE_SIGN_PFX_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODE_SIGN_PFX_BASE64))
+          $signtool = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          & $signtool sign /f $pfxPath /p $env:CODE_SIGN_PFX_PASSWORD /fd SHA256 /t http://timestamp.digicert.com dist\EcoEnforcer.exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
+          Remove-Item $pfxPath -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

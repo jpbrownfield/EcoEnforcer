@@ -18,18 +18,23 @@ import os
 import sys
 import json
 import re
+import shutil
 import subprocess
 import time
 import logging
 import threading
 import ctypes
 import winreg
+import urllib.request
+import urllib.error
+import tkinter as tk
+from tkinter import ttk
 from ctypes import wintypes
 from enum import Enum, auto
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 import pystray
 import psutil
 import comtypes
@@ -110,6 +115,8 @@ POWER_SCHEME_RE = re.compile(r"Power Scheme GUID:\s*([0-9a-fA-F-]{36})\s*\(([^)]
 kernel32 = ctypes.windll.kernel32 if sys.platform == "win32" else None
 user32 = ctypes.windll.user32 if sys.platform == "win32" else None
 powrprof = ctypes.windll.powrprof if sys.platform == "win32" else None
+shell32 = ctypes.windll.shell32 if sys.platform == "win32" else None
+version_dll = ctypes.windll.version if sys.platform == "win32" else None
 
 if kernel32 is not None:
     # Explicit prototypes prevent HANDLE/pointer truncation on 64-bit Windows.
@@ -144,6 +151,8 @@ if kernel32 is not None:
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.GetForegroundWindow.argtypes = []
     user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
+    user32.SystemParametersInfoW.restype = wintypes.BOOL
 
     kernel32.GetSystemPowerStatus.argtypes = [ctypes.POINTER(SYSTEM_POWER_STATUS)]
     kernel32.GetSystemPowerStatus.restype = wintypes.BOOL
@@ -151,6 +160,16 @@ if kernel32 is not None:
     kernel32.LocalFree.restype = wintypes.HANDLE
     powrprof.PowerGetActiveScheme.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.POINTER(GUID))]
     powrprof.PowerGetActiveScheme.restype = wintypes.DWORD
+
+if version_dll is not None:
+    version_dll.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+    version_dll.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+    version_dll.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID]
+    version_dll.GetFileVersionInfoW.restype = wintypes.BOOL
+    version_dll.VerQueryValueW.argtypes = [
+        wintypes.LPCVOID, wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT)
+    ]
+    version_dll.VerQueryValueW.restype = wintypes.BOOL
 
 ERROR_ALREADY_EXISTS = 183
 
@@ -211,9 +230,10 @@ ECO_QOS_ONLY_TAG = "ECO_QOS_ONLY"
 # the windowed-app enforcement loop (every Nth enforce_step cycle, ~15s at the 1.5s poll rate).
 BACKGROUND_SCAN_EVERY_N_CYCLES = 10
 
-# If something keeps fighting us and resetting the same non-NORMAL tier, stop re-applying
-# it after this many consecutive overwrites rather than fighting forever.
-OVERWRITE_GIVEUP_CYCLES = 10
+# If something keeps fighting us and resetting the same non-NORMAL tier, we keep
+# re-applying forever (a SetPriorityClass/EcoQoS call is cheap), just logging a reminder
+# every this many consecutive overwrites so persistent fights are still visible.
+OVERWRITE_LOG_INTERVAL_CYCLES = 20
 
 # A newly-detected process is left completely untouched for this long so we can read its
 # natural priority/EcoQoS before ever overwriting it. Skipped at daemon startup, since
@@ -384,14 +404,123 @@ def get_foreground_pid() -> int:
     return pid.value
 
 
-def is_protected(pid: int) -> bool:
-    """Returns True if the pid belongs to a protected shell process, is our own, or no longer exists."""
+def is_protected(pid: int, excluded_processes: frozenset[str] = frozenset()) -> bool:
+    """Returns True if the pid belongs to a protected/user-excluded process, is our own, or no longer exists."""
     if pid == os.getpid():
         return True
     try:
-        return psutil.Process(pid).name().lower() in PROTECTED_PROCESSES
+        name = psutil.Process(pid).name().lower()
+        return name in PROTECTED_PROCESSES or name in excluded_processes
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return True
+
+
+def get_friendly_name(exe_path: str) -> str | None:
+    """Reads the FileDescription field from an executable's version resource, if present."""
+    if version_dll is None or not exe_path:
+        return None
+    try:
+        size = version_dll.GetFileVersionInfoSizeW(exe_path, None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not version_dll.GetFileVersionInfoW(exe_path, 0, size, buf):
+            return None
+
+        trans_ptr = ctypes.c_void_p()
+        trans_len = wintypes.UINT()
+        if not version_dll.VerQueryValueW(
+            buf, "\\VarFileInfo\\Translation", ctypes.byref(trans_ptr), ctypes.byref(trans_len)
+        ) or trans_len.value < 4:
+            return None
+        lang, codepage = ctypes.cast(trans_ptr, ctypes.POINTER(ctypes.c_uint16 * 2)).contents
+
+        desc_ptr = ctypes.c_void_p()
+        desc_len = wintypes.UINT()
+        subblock = f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\FileDescription"
+        if not version_dll.VerQueryValueW(
+            buf, subblock, ctypes.byref(desc_ptr), ctypes.byref(desc_len)
+        ) or not desc_len.value:
+            return None
+        return ctypes.wstring_at(desc_ptr, desc_len.value - 1).strip() or None
+    except OSError:
+        return None
+
+
+def collect_process_rows() -> list[dict]:
+    """One-time snapshot of every running process, grouped by executable name.
+
+    Includes a short CPU sample (blocks briefly to get a real reading, since psutil's
+    first cpu_percent() call is always meaningless) -- used to populate the Excluded
+    Processes window. Excludes always-protected system processes and ourselves.
+    """
+    own_name = (get_process_name(os.getpid()) or "").lower()
+    procs = []
+    for proc in psutil.process_iter(['name']):
+        try:
+            name = proc.info['name']
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if not name:
+            continue
+        lname = name.lower()
+        if lname in PROTECTED_PROCESSES or lname == own_name:
+            continue
+        try:
+            proc.cpu_percent(None)  # prime the sample; first call is meaningless
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        procs.append(proc)
+
+    time.sleep(0.2)
+
+    rows: dict[str, dict] = {}
+    for proc in procs:
+        try:
+            name = proc.info['name']
+            exe_path = proc.exe()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            exe_path = ""
+        try:
+            cpu = proc.cpu_percent(None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        lname = name.lower()
+        row = rows.setdefault(lname, {"name": name, "path": exe_path, "cpu": 0.0})
+        row["cpu"] += cpu
+        if not row["path"] and exe_path:
+            row["path"] = exe_path
+
+    for row in rows.values():
+        row["friendly"] = get_friendly_name(row["path"]) or row["name"]
+
+    return sorted(rows.values(), key=lambda r: r["friendly"].lower())
+
+
+def is_running_as_admin() -> bool:
+    """Returns True if this process has an elevated (administrator) token."""
+    if shell32 is None:
+        return False
+    try:
+        return bool(shell32.IsUserAnAdmin())
+    except OSError:
+        return False
+
+
+_SPI_GETWORKAREA = 0x0030
+
+
+def get_work_area() -> tuple[int, int, int, int] | None:
+    """Returns (left, top, right, bottom) of the screen area excluding the taskbar, or None."""
+    if user32 is None:
+        return None
+    try:
+        rect = wintypes.RECT()
+        if user32.SystemParametersInfoW(_SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+            return (rect.left, rect.top, rect.right, rect.bottom)
+    except OSError:
+        pass
+    return None
 
 
 def get_process_name(pid: int) -> str | None:
@@ -539,12 +668,18 @@ def load_settings() -> dict:
         return {}
 
 
-def save_settings(disable_on_ac: bool, power_plan_enabled: dict[str, bool]) -> None:
+def save_settings(
+    disable_on_ac: bool, power_plan_enabled: dict[str, bool], excluded_processes: list[str] = (),
+) -> None:
     """Persists user-configurable settings so tray checkbox choices survive a restart."""
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
         SETTINGS_FILE.write_text(
-            json.dumps({"disable_on_ac": disable_on_ac, "power_plan_enabled": power_plan_enabled}),
+            json.dumps({
+                "disable_on_ac": disable_on_ac,
+                "power_plan_enabled": power_plan_enabled,
+                "excluded_processes": list(excluded_processes),
+            }),
             encoding="utf-8",
         )
     except OSError:
@@ -553,6 +688,7 @@ def save_settings(disable_on_ac: bool, power_plan_enabled: dict[str, bool]) -> N
 
 STARTUP_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "EcoEnforcer"
+STARTUP_TASK_NAME = "EcoEnforcer"
 
 
 def _get_startup_command() -> str:
@@ -562,21 +698,70 @@ def _get_startup_command() -> str:
     return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
 
 
+def _scheduled_task_exists() -> bool:
+    """Checks whether the elevated Task Scheduler startup entry is registered."""
+    try:
+        result = subprocess.run(
+            ["schtasks", "/Query", "/TN", STARTUP_TASK_NAME],
+            capture_output=True, timeout=5, check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _create_scheduled_task() -> None:
+    """Registers a Task Scheduler entry that (re)launches EcoEnforcer elevated at logon.
+
+    The HKCU Run key always launches non-elevated regardless of the privilege level it
+    was toggled on with, so an admin-mode run needs Task Scheduler's /RL HIGHEST instead
+    to actually come back up elevated next logon.
+    """
+    try:
+        subprocess.run(
+            ["schtasks", "/Create", "/TN", STARTUP_TASK_NAME, "/TR", _get_startup_command(),
+             "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"],
+            capture_output=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.debug("Failed to create elevated startup task", exc_info=True)
+
+
+def _delete_scheduled_task() -> None:
+    """Removes the elevated Task Scheduler startup entry, if any."""
+    try:
+        subprocess.run(
+            ["schtasks", "/Delete", "/TN", STARTUP_TASK_NAME, "/F"],
+            capture_output=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.debug("Failed to delete elevated startup task", exc_info=True)
+
+
 def is_startup_enabled() -> bool:
-    """Checks whether EcoEnforcer is registered to launch at Windows logon."""
+    """Checks whether EcoEnforcer is registered to launch at Windows logon, via either
+    the registry Run entry or (when last enabled while elevated) the Task Scheduler entry."""
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REGISTRY_KEY, 0, winreg.KEY_READ) as key:
             winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
         return True
     except OSError:
-        return False
+        pass
+    return _scheduled_task_exists()
 
 
 def set_startup_enabled(enabled: bool) -> None:
-    """Adds or removes the registry entry that launches EcoEnforcer at Windows logon."""
+    """Registers/unregisters EcoEnforcer to launch at Windows logon.
+
+    The Run registry key always launches non-elevated, so if we're currently running as
+    admin, a Task Scheduler entry (/RL HIGHEST) is used instead -- otherwise a startup
+    launch would silently drop back to unelevated and "Manage All Processes" wouldn't
+    hold across a reboot. Only one of the two is ever kept registered at a time.
+    """
+    use_task = enabled and is_running_as_admin()
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REGISTRY_KEY, 0, winreg.KEY_WRITE) as key:
-            if enabled:
+            if enabled and not use_task:
                 winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, _get_startup_command())
             else:
                 try:
@@ -585,6 +770,117 @@ def set_startup_enabled(enabled: bool) -> None:
                     pass
     except OSError:
         logger.debug("Failed to update startup registry entry", exc_info=True)
+
+    if use_task:
+        _create_scheduled_task()
+    else:
+        _delete_scheduled_task()
+
+
+# --- Self-update ---
+
+GITHUB_REPO = "jpbrownfield/EcoEnforcer"
+GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_ASSET_NAME = "EcoEnforcer.exe"
+# Thumbprint of the self-signed code-signing cert used to sign release builds (see
+# .github/workflows/build.yml). Pinned here so a downloaded update is only ever applied
+# if it was signed with our own key -- not just any Authenticode-signed binary.
+UPDATE_SIGNING_THUMBPRINT = "6789EE263EB2F64D61AC10AAA9456320EFCEA889"
+
+
+def get_current_version() -> str:
+    """Returns this build's version, stamped into version.txt at build time by CI."""
+    if getattr(sys, "frozen", False):
+        try:
+            return (Path(sys._MEIPASS) / "version.txt").read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    return "0.0.0-dev"
+
+
+def _parse_version(version: str) -> tuple[int, ...]:
+    """Parses a (possibly 'v'-prefixed) dotted version into a comparable tuple."""
+    return tuple(int(part) for part in re.findall(r"\d+", version)) or (0,)
+
+
+def check_for_update() -> tuple[str, str] | None:
+    """Checks the latest GitHub release; returns (version, download_url) if it's newer."""
+    try:
+        request = urllib.request.Request(
+            GITHUB_LATEST_RELEASE_API,
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "EcoEnforcer"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+
+    latest_tag = data.get("tag_name") or ""
+    if not latest_tag or _parse_version(latest_tag) <= _parse_version(get_current_version()):
+        return None
+
+    for asset in data.get("assets", []):
+        if asset.get("name") == UPDATE_ASSET_NAME and asset.get("browser_download_url"):
+            return latest_tag, asset["browser_download_url"]
+    return None
+
+
+def _download_update(url: str, dest: Path) -> bool:
+    """Downloads the release asset to dest; returns False on any failure."""
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "EcoEnforcer"})
+        with urllib.request.urlopen(request, timeout=60) as response, dest.open("wb") as out_file:
+            shutil.copyfileobj(response, out_file)
+        return True
+    except OSError:
+        return False
+
+
+def _verify_update_signature(exe_path: Path) -> bool:
+    """Confirms exe_path is Authenticode-signed with our pinned certificate thumbprint."""
+    try:
+        result = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                f"(Get-AuthenticodeSignature -FilePath '{exe_path}').SignerCertificate.Thumbprint",
+            ],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    thumbprint = result.stdout.strip()
+    return bool(thumbprint) and thumbprint.upper() == UPDATE_SIGNING_THUMBPRINT.upper()
+
+
+def apply_update(new_exe_path: Path) -> None:
+    """Launches a detached helper .bat that waits for this process to exit, replaces the
+    running executable (wherever it's installed) with new_exe_path, relaunches it, then
+    deletes itself. Windows won't let a running exe overwrite its own file, hence the helper.
+    """
+    current_exe = Path(sys.executable)
+    pid = os.getpid()
+    update_dir = APP_DATA_DIR / "update"
+    update_dir.mkdir(parents=True, exist_ok=True)
+    bat_path = update_dir / "apply_update.bat"
+    bat_path.write_text(
+        "@echo off\r\n"
+        ":wait\r\n"
+        f'tasklist /fi "PID eq {pid}" | findstr /i "{pid}" >nul\r\n'
+        "if %errorlevel%==0 (\r\n"
+        "  timeout /t 1 /nobreak >nul\r\n"
+        "  goto wait\r\n"
+        ")\r\n"
+        f'move /y "{new_exe_path}" "{current_exe}" >nul\r\n'
+        f'start "" "{current_exe}"\r\n'
+        '(goto) 2>nul & del "%~f0"\r\n',
+        encoding="utf-8",
+    )
+    subprocess.Popen(
+        ["cmd", "/c", str(bat_path)],
+        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        close_fds=True,
+    )
 
 
 # --- Daemon engine ---
@@ -595,8 +891,8 @@ class EcoEnforcerDaemon:
         self.paused = False
         # Tracks current tier: {pid: ThrottleTier}
         self.managed_pids: dict[int, ThrottleTier] = {}
-        # Consecutive same-tier reassertions per pid; used to stop fighting a process that
-        # keeps resetting its own eco tier (see OVERWRITE_GIVEUP_CYCLES).
+        # Consecutive same-tier reassertions per pid; used only to throttle the log spam
+        # for a process that keeps resetting its own eco tier (see OVERWRITE_LOG_INTERVAL_CYCLES).
         self.overwrite_streak: dict[int, int] = {}
         # Pids that have ever owned a titled window; kept governed even after the window
         # is hidden (e.g. closed to tray), until the process actually exits.
@@ -625,6 +921,10 @@ class EcoEnforcerDaemon:
         settings = load_settings()
         self.disable_on_ac: bool = settings.get("disable_on_ac", True)
         self.power_plan_enabled: dict[str, bool] = dict(settings.get("power_plan_enabled", {}))
+        # Process names (lowercase) the user has chosen to never throttle/EcoQoS at all.
+        self.excluded_processes: set[str] = {
+            name.lower() for name in settings.get("excluded_processes", [])
+        }
         # Guards managed_pids/known_pids since the worker thread and quit/pause handlers touch them concurrently
         self._lock = threading.Lock()
 
@@ -713,7 +1013,7 @@ class EcoEnforcerDaemon:
             target_states: dict[int, ThrottleTier] = {
                 pid: decide_tier(pid, foreground_pid, audio_pids)
                 for pid in self.known_pids
-                if not is_protected(pid)
+                if not is_protected(pid, self.excluded_processes)
             }
 
             # Windows only boosts the specific pid that owns the focused window, so a
@@ -722,7 +1022,7 @@ class EcoEnforcerDaemon:
             descendant_targets: dict[int, ThrottleTier] = {}
             for owner_pid, tier in target_states.items():
                 for child_pid in get_descendant_pids(owner_pid):
-                    if child_pid in self.known_pids or is_protected(child_pid):
+                    if child_pid in self.known_pids or is_protected(child_pid, self.excluded_processes):
                         continue
                     descendant_targets.setdefault(child_pid, tier)
             for pid, tier in descendant_targets.items():
@@ -734,8 +1034,9 @@ class EcoEnforcerDaemon:
             # tool, etc.), so trusting our own bookkeeping alone would let external changes
             # silently stick. The known_pids set is small, so re-applying is cheap.
             # NORMAL is never fought for -- it's the default state, so the process is free to
-            # raise its own priority while foreground. Non-NORMAL tiers are re-applied until
-            # OVERWRITE_GIVEUP_CYCLES consecutive overwrites, then we stop fighting for that pid.
+            # raise its own priority while foreground. Non-NORMAL tiers are re-applied forever,
+            # never giving up, since a process resetting itself doesn't mean we should stop
+            # correcting it back.
             for pid, target_tier in target_states.items():
                 # A newly-detected process is left untouched until we've read its natural
                 # state, so we never overwrite it -- in either direction -- before then.
@@ -746,11 +1047,8 @@ class EcoEnforcerDaemon:
                 current_tier = self.managed_pids.get(pid, ThrottleTier.NORMAL)
                 is_transition = target_tier != current_tier
 
-                if not is_transition:
-                    if target_tier == ThrottleTier.NORMAL:
-                        continue
-                    if self.overwrite_streak.get(pid, 0) >= OVERWRITE_GIVEUP_CYCLES:
-                        continue
+                if not is_transition and target_tier == ThrottleTier.NORMAL:
+                    continue
 
                 if apply_throttle_tier(pid, target_tier, baseline):
                     if is_transition:
@@ -758,9 +1056,9 @@ class EcoEnforcerDaemon:
                         self.overwrite_streak[pid] = 0
                     elif target_tier != ThrottleTier.NORMAL:
                         self.overwrite_streak[pid] = self.overwrite_streak.get(pid, 0) + 1
-                        if self.overwrite_streak[pid] == OVERWRITE_GIVEUP_CYCLES:
+                        if self.overwrite_streak[pid] % OVERWRITE_LOG_INTERVAL_CYCLES == 0:
                             logger.info(
-                                "%s kept resetting %s -- no longer re-enforcing it",
+                                "%s still resetting %s -- continuing to re-enforce it",
                                 describe_pid(pid), target_tier.name)
                     self.managed_pids[pid] = target_tier
                 else:
@@ -790,7 +1088,7 @@ class EcoEnforcerDaemon:
                 self.eco_qos_pids.discard(pid)
 
         for pid in candidates:
-            if is_protected(pid):
+            if is_protected(pid, self.excluded_processes):
                 continue
 
             proc = self.background_procs.get(pid)
@@ -854,6 +1152,27 @@ class EcoEnforcerDaemon:
 
             persist_managed_state(self.managed_pids, self.eco_qos_pids)
 
+    def restore_process_name(self, name: str) -> None:
+        """Restores every currently-managed pid matching this executable name to NORMAL.
+
+        Called right when the user excludes a process that's already throttled, so the
+        exclusion takes effect immediately rather than waiting for the process to exit.
+        """
+        lname = name.lower()
+        with self._lock:
+            for pid in [p for p in self.managed_pids if (get_process_name(p) or "").lower() == lname]:
+                tier = self.managed_pids.pop(pid)
+                self.overwrite_streak.pop(pid, None)
+                if tier != ThrottleTier.NORMAL and apply_throttle_tier(
+                    pid, ThrottleTier.NORMAL, self.natural_baseline.get(pid)
+                ):
+                    logger.info("%s -> NORMAL (excluded)", describe_pid(pid))
+            for pid in [p for p in self.eco_qos_pids if (get_process_name(p) or "").lower() == lname]:
+                if apply_ecoqos_only(pid, False):
+                    logger.info("%s -> EcoQoS off (excluded)", describe_pid(pid))
+                self.eco_qos_pids.discard(pid)
+            persist_managed_state(self.managed_pids, self.eco_qos_pids)
+
     def get_stats(self) -> int:
         """Returns the number of processes currently throttled into any eco tier."""
         with self._lock:
@@ -903,6 +1222,183 @@ def acquire_single_instance_lock():
     return mutex
 
 
+_CHECKBOX_CHECKED = "\u2611"
+_CHECKBOX_UNCHECKED = "\u2610"
+
+
+def _open_excluded_processes_window(daemon: "EcoEnforcerDaemon") -> None:  # pragma: no cover -- real Tk GUI
+    """Builds and runs a scrollable, searchable window for managing excluded processes.
+
+    Runs its own Tk() + mainloop() on the calling (dedicated) thread, so it's self-contained
+    and doesn't interfere with the pystray icon's own thread. The process/CPU snapshot is
+    taken once at open time rather than kept live, per the window's purpose as a picker.
+    """
+    rows = collect_process_rows()
+
+    root = tk.Tk()
+    root.title("EcoEnforcer - Excluded Processes")
+
+    width, height = 700, 440
+    work_area = get_work_area()
+    if work_area:
+        left, top, right, bottom = work_area
+        # Clamp the window to the work area (screen minus taskbar) so it never draws
+        # underneath the taskbar; center it within that area instead of the full screen.
+        height = min(height, bottom - top)
+        x = left + max(0, ((right - left) - width) // 2)
+        y = top + max(0, ((bottom - top) - height) // 2)
+        root.geometry(f"{width}x{height}+{x}+{y}")
+    else:
+        root.geometry(f"{width}x{height}")
+
+    # Reuse the tray's green leaf icon instead of the default Tk/Python one; the
+    # PhotoImage reference must be kept alive on the widget or it gets garbage collected.
+    icon_photo = ImageTk.PhotoImage(create_tray_icon_image("#22C55E"))
+    root.iconphoto(True, icon_photo)
+    root._icon_photo = icon_photo
+
+    if not is_running_as_admin():
+        ttk.Label(
+            root, text="Run in Admin Mode to Manage All Processes",
+            foreground="#B45309", padding=(8, 8, 8, 0),
+        ).pack(fill="x")
+
+    search_frame = ttk.Frame(root, padding=(8, 8, 8, 0))
+    search_frame.pack(fill="x")
+    ttk.Label(search_frame, text="Search:").pack(side="left")
+    search_var = tk.StringVar()
+    ttk.Entry(search_frame, textvariable=search_var).pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+    tree_frame = ttk.Frame(root, padding=8)
+    tree_frame.pack(fill="both", expand=True)
+
+    columns = ("check", "friendly", "exe", "path", "cpu")
+    column_headings = {
+        "check": "", "friendly": "Friendly Name", "exe": "Executable", "path": "Path", "cpu": "CPU %",
+    }
+    tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="none")
+    for col, width, anchor in (
+        ("check", 28, "center"),
+        ("friendly", 170, "w"),
+        ("exe", 130, "w"),
+        ("path", 280, "w"),
+        ("cpu", 60, "e"),
+    ):
+        tree.column(col, width=width, anchor=anchor, stretch=(col == "path"))
+
+    scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=scrollbar.set)
+    tree.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    def checkbox_for(lname: str) -> str:
+        return _CHECKBOX_CHECKED if lname in daemon.excluded_processes else _CHECKBOX_UNCHECKED
+
+    # Sorting: "check" puts every currently-excluded process at the top when ascending.
+    sort_key_funcs = {
+        "check": lambda row: row["name"].lower() not in daemon.excluded_processes,
+        "friendly": lambda row: row["friendly"].lower(),
+        "exe": lambda row: row["name"].lower(),
+        "path": lambda row: (row["path"] or "").lower(),
+        "cpu": lambda row: row["cpu"],
+    }
+    sort_state = {"column": "friendly", "reverse": False}
+
+    def update_headings() -> None:
+        for col, text in column_headings.items():
+            arrow = ""
+            if col == sort_state["column"]:
+                arrow = " \u25bc" if sort_state["reverse"] else " \u25b2"
+            tree.heading(col, text=f"{text}{arrow}", command=lambda c=col: sort_by(c))
+
+    def sort_by(column: str) -> None:
+        if sort_state["column"] == column:
+            sort_state["reverse"] = not sort_state["reverse"]
+        else:
+            sort_state["column"] = column
+            sort_state["reverse"] = False
+        update_headings()
+        populate(search_var.get())
+
+    def populate(filter_text: str = "") -> None:
+        tree.delete(*tree.get_children())
+        needle = filter_text.strip().lower()
+        filtered = [
+            row for row in rows
+            if not needle or needle in row["friendly"].lower() or needle in row["name"].lower()
+        ]
+        filtered.sort(key=sort_key_funcs[sort_state["column"]], reverse=sort_state["reverse"])
+        for row in filtered:
+            lname = row["name"].lower()
+            tree.insert("", "end", iid=lname, values=(
+                checkbox_for(lname), row["friendly"], row["name"], row["path"], f'{row["cpu"]:.1f}',
+            ))
+
+    def on_search_change(*_args) -> None:
+        populate(search_var.get())
+
+    search_var.trace_add("write", on_search_change)
+
+    def on_click(event) -> None:
+        if tree.identify_region(event.x, event.y) != "cell" or tree.identify_column(event.x) != "#1":
+            return
+        lname = tree.identify_row(event.y)
+        if not lname:
+            return
+        if lname in daemon.excluded_processes:
+            daemon.excluded_processes.discard(lname)
+        else:
+            daemon.excluded_processes.add(lname)
+            daemon.restore_process_name(lname)
+        save_settings(daemon.disable_on_ac, daemon.power_plan_enabled, daemon.excluded_processes)
+        tree.set(lname, "check", checkbox_for(lname))
+
+    tree.bind("<Button-1>", on_click)
+
+    update_headings()
+    populate()
+    root.mainloop()
+
+
+_TopAlignedTrayIcon = pystray.Icon
+if sys.platform == "win32":
+    try:
+        from pystray._util import win32 as _pystray_win32
+
+        class _TopAlignedTrayIcon(pystray.Icon):  # noqa: F811 -- intentional win32-only override
+            """pystray's win32 backend anchors the popup menu's bottom edge to the raw
+            cursor position, which sits inside the taskbar for a tray-icon click --
+            letting the menu's bottom rows render underneath the taskbar. Clamping the
+            anchor y-coordinate to the work area's bottom (the taskbar's top edge)
+            guarantees the whole menu draws above it.
+            """
+
+            def _on_notify(self, wparam, lparam):
+                if not (self._menu_handle and lparam == _pystray_win32.WM_RBUTTONUP):
+                    return super()._on_notify(wparam, lparam)
+
+                _pystray_win32.SetForegroundWindow(self._hwnd)
+
+                point = wintypes.POINT()
+                _pystray_win32.GetCursorPos(ctypes.byref(point))
+                work_area = get_work_area()
+                if work_area:
+                    point.y = min(point.y, work_area[3])
+
+                hmenu, descriptors = self._menu_handle
+                index = _pystray_win32.TrackPopupMenuEx(
+                    hmenu,
+                    _pystray_win32.TPM_RIGHTALIGN | _pystray_win32.TPM_BOTTOMALIGN
+                    | _pystray_win32.TPM_RETURNCMD,
+                    point.x, point.y, self._menu_hwnd, None)
+                if index > 0:
+                    descriptors[index - 1](self)
+    except ImportError:
+        # pystray is stubbed out (e.g. under test on a non-Windows runner); keep the
+        # plain pystray.Icon fallback assigned above.
+        pass
+
+
 def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows session to run
     configure_logging()
 
@@ -950,13 +1446,13 @@ def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows sess
 
     def toggle_disable_on_ac(icon, item):
         daemon.disable_on_ac = not daemon.disable_on_ac
-        save_settings(daemon.disable_on_ac, daemon.power_plan_enabled)
+        save_settings(daemon.disable_on_ac, daemon.power_plan_enabled, daemon.excluded_processes)
 
     def make_toggle_plan(guid):
         def toggle_plan(icon, item):
             current = daemon.power_plan_enabled.get(guid, default_power_plan_enabled(guid))
             daemon.power_plan_enabled[guid] = not current
-            save_settings(daemon.disable_on_ac, daemon.power_plan_enabled)
+            save_settings(daemon.disable_on_ac, daemon.power_plan_enabled, daemon.excluded_processes)
         return toggle_plan
 
     def make_plan_checked(guid):
@@ -964,6 +1460,53 @@ def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows sess
 
     def toggle_run_on_startup(icon, item):
         set_startup_enabled(not is_startup_enabled())
+
+    # Guards against opening a second window while one is already up.
+    _excluded_window_open = threading.Event()
+
+    def open_excluded_processes_window(icon, item):
+        if _excluded_window_open.is_set():
+            return
+        _excluded_window_open.set()
+
+        def worker():
+            try:
+                _open_excluded_processes_window(daemon)
+            finally:
+                _excluded_window_open.clear()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def check_and_apply_update(icon, item):
+        def worker():
+            result = check_for_update()
+            if result is None:
+                icon.notify("You're running the latest version.", "EcoEnforcer")
+                return
+            new_version, download_url = result
+            if not getattr(sys, "frozen", False):
+                icon.notify(f"Update {new_version} available, but auto-update only "
+                            "works from the built executable.", "EcoEnforcer")
+                return
+
+            icon.notify(f"Downloading EcoEnforcer {new_version}...", "EcoEnforcer")
+            update_dir = APP_DATA_DIR / "update"
+            update_dir.mkdir(parents=True, exist_ok=True)
+            new_exe_path = update_dir / "EcoEnforcer.new.exe"
+            if not _download_update(download_url, new_exe_path):
+                icon.notify("Update download failed.", "EcoEnforcer")
+                return
+            if not _verify_update_signature(new_exe_path):
+                new_exe_path.unlink(missing_ok=True)
+                logger.warning("Downloaded update failed signature verification; discarding")
+                icon.notify("Update signature verification failed -- discarded for safety.", "EcoEnforcer")
+                return
+
+            logger.info("Update %s verified; applying and restarting", new_version)
+            apply_update(new_exe_path)
+            on_quit(icon, item)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     power_plans = list_power_plans()
     if power_plans:
@@ -988,11 +1531,13 @@ def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows sess
             "Disable when Plugged In", toggle_disable_on_ac, checked=lambda item: daemon.disable_on_ac,
         ),
         pystray.MenuItem("Use With Power Plans:", pystray.Menu(*plan_menu_items)),
+        pystray.MenuItem("Manage Excluded Processes...", open_excluded_processes_window),
         pystray.MenuItem("Run on Startup", toggle_run_on_startup, checked=lambda item: is_startup_enabled()),
+        pystray.MenuItem("Check for Updates", check_and_apply_update),
         pystray.MenuItem("Quit", on_quit)
     )
 
-    tray_icon = pystray.Icon("EcoEnforcer", icon_green, "EcoEnforcer", menu)
+    tray_icon = _TopAlignedTrayIcon("EcoEnforcer", icon_green, "EcoEnforcer", menu)
 
     def refresh_status():
         status_text = daemon.get_status_text()
