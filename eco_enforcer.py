@@ -23,6 +23,7 @@ import time
 import logging
 import threading
 import ctypes
+import winreg
 from ctypes import wintypes
 from enum import Enum, auto
 from pathlib import Path
@@ -384,7 +385,9 @@ def get_foreground_pid() -> int:
 
 
 def is_protected(pid: int) -> bool:
-    """Returns True if the pid belongs to a protected shell process or no longer exists."""
+    """Returns True if the pid belongs to a protected shell process, is our own, or no longer exists."""
+    if pid == os.getpid():
+        return True
     try:
         return psutil.Process(pid).name().lower() in PROTECTED_PROCESSES
     except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -548,6 +551,42 @@ def save_settings(disable_on_ac: bool, power_plan_enabled: dict[str, bool]) -> N
         logger.debug("Failed to persist settings", exc_info=True)
 
 
+STARTUP_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_VALUE_NAME = "EcoEnforcer"
+
+
+def _get_startup_command() -> str:
+    """Builds the command line to register in the startup registry key."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
+
+def is_startup_enabled() -> bool:
+    """Checks whether EcoEnforcer is registered to launch at Windows logon."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REGISTRY_KEY, 0, winreg.KEY_READ) as key:
+            winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
+        return True
+    except OSError:
+        return False
+
+
+def set_startup_enabled(enabled: bool) -> None:
+    """Adds or removes the registry entry that launches EcoEnforcer at Windows logon."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REGISTRY_KEY, 0, winreg.KEY_WRITE) as key:
+            if enabled:
+                winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, _get_startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, STARTUP_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+    except OSError:
+        logger.debug("Failed to update startup registry entry", exc_info=True)
+
+
 # --- Daemon engine ---
 
 class EcoEnforcerDaemon:
@@ -659,7 +698,7 @@ class EcoEnforcerDaemon:
         visible_pids = get_visible_window_pids()
 
         with self._lock:
-            self.known_pids |= visible_pids
+            self.known_pids |= visible_pids - {os.getpid()}
 
             # Stop tracking any pid that no longer exists, wherever it came from
             # (a known window owner or a governed descendant).
@@ -923,6 +962,9 @@ def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows sess
     def make_plan_checked(guid):
         return lambda item: daemon.power_plan_enabled.get(guid, default_power_plan_enabled(guid))
 
+    def toggle_run_on_startup(icon, item):
+        set_startup_enabled(not is_startup_enabled())
+
     power_plans = list_power_plans()
     if power_plans:
         plan_menu_items = [
@@ -946,6 +988,7 @@ def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows sess
             "Disable when Plugged In", toggle_disable_on_ac, checked=lambda item: daemon.disable_on_ac,
         ),
         pystray.MenuItem("Use With Power Plans:", pystray.Menu(*plan_menu_items)),
+        pystray.MenuItem("Run on Startup", toggle_run_on_startup, checked=lambda item: is_startup_enabled()),
         pystray.MenuItem("Quit", on_quit)
     )
 
@@ -955,6 +998,10 @@ def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows sess
         status_text = daemon.get_status_text()
         tray_icon.icon = icon_green if status_text.startswith("EcoEnforcer Active") else icon_yellow
         tray_icon.title = f"{status_text}\nEco Mode Processes: {daemon.get_stats()}"
+        # pystray caches the rendered menu (status line, process count, Pause/Resume label)
+        # and only recomputes it on an explicit update_menu() call, not on every popup --
+        # without this, those dynamic labels go stale until some menu item is clicked.
+        tray_icon.update_menu()
 
     def update_tooltip():
         while daemon.running:

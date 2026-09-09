@@ -60,6 +60,10 @@ class TestIsProtected:
         with patch("eco_enforcer.psutil.Process", side_effect=psutil.NoSuchProcess(123)):
             assert ee.is_protected(123) is True
 
+    def test_own_pid_is_treated_as_protected(self):
+        with patch("eco_enforcer.os.getpid", return_value=123):
+            assert ee.is_protected(123) is True
+
 
 class TestDescribePid:
     def test_includes_process_name_when_available(self):
@@ -500,6 +504,38 @@ class TestSaveSettings:
              patch("eco_enforcer.SETTINGS_FILE", tmp_path / "settings.json"), \
              patch("eco_enforcer.Path.write_text", side_effect=OSError("disk full")):
             ee.save_settings(True, {})  # must not raise
+
+
+class TestStartupRegistry:
+    def test_is_startup_enabled_true_when_value_present(self):
+        with patch("eco_enforcer.winreg") as mock_winreg:
+            mock_winreg.OpenKey.return_value.__enter__.return_value = MagicMock()
+            assert ee.is_startup_enabled() is True
+
+    def test_is_startup_enabled_false_when_key_missing(self):
+        with patch("eco_enforcer.winreg") as mock_winreg:
+            mock_winreg.OpenKey.side_effect = OSError()
+            assert ee.is_startup_enabled() is False
+
+    def test_set_startup_enabled_true_writes_value(self):
+        with patch("eco_enforcer.winreg") as mock_winreg:
+            key = MagicMock()
+            mock_winreg.OpenKey.return_value.__enter__.return_value = key
+            ee.set_startup_enabled(True)
+            assert key is mock_winreg.SetValueEx.call_args[0][0]
+            assert mock_winreg.SetValueEx.call_args[0][1] == ee.STARTUP_VALUE_NAME
+
+    def test_set_startup_enabled_false_deletes_value(self):
+        with patch("eco_enforcer.winreg") as mock_winreg:
+            key = MagicMock()
+            mock_winreg.OpenKey.return_value.__enter__.return_value = key
+            ee.set_startup_enabled(False)
+            mock_winreg.DeleteValue.assert_called_once_with(key, ee.STARTUP_VALUE_NAME)
+
+    def test_set_startup_enabled_swallows_registry_errors(self):
+        with patch("eco_enforcer.winreg") as mock_winreg:
+            mock_winreg.OpenKey.side_effect = OSError("access denied")
+            ee.set_startup_enabled(True)  # must not raise
 
 
 class TestEcoEnforcerDaemonEnforceStep:
