@@ -72,13 +72,13 @@ The app runs from the system tray. Right-clicking the icon shows the current
 status and Eco process count as the first two (unclickable) lines, followed
 by:
 
-- **Pause/Resume Eco Handler** — manually pause (restores all managed
-  processes to Normal priority and switches off background EcoQoS) or resume.
-  If enforcement is currently auto-paused due to AC power or the active power
-  plan, this instead reads "Resume Eco Handler" and clicking it manually
-  overrides that auto-pause without changing the underlying settings. The
-  override lasts only until the triggering condition itself clears and comes
-  back (e.g. unplug/replug, or switching power plans away and back) — auto-pause
+- **Pause/Resume** — manually pause (restores all managed processes to
+  Normal priority and switches off background EcoQoS) or resume. If
+  enforcement is currently auto-paused due to AC power or the active power
+  plan, this instead reads "Resume" and clicking it manually overrides that
+  auto-pause without changing the underlying settings. The override lasts
+  only until the triggering condition itself clears and comes back (e.g.
+  unplug/replug, or switching power plans away and back) — auto-pause
   reasserts itself at that point.
 - **Disable when Plugged In** — auto-pauses enforcement while on AC power
   (with a battery present).

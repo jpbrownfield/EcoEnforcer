@@ -823,10 +823,36 @@ class EcoEnforcerDaemon:
 
 # --- System tray application ---
 
+# Outline of the Material Design Icons "leaf" glyph (Apache License 2.0,
+# https://github.com/Templarian/MaterialDesign), flattened from its SVG bezier path and
+# scaled from a 24x24 viewBox to this app's 64x64 icon canvas.
+_LEAF_POLYGON_POINTS = (
+    (44.1, 22.3), (40.2, 23.4), (36.7, 24.6), (33.5, 26.0), (30.6, 27.7), (28.1, 29.4),
+    (25.8, 31.4), (23.7, 33.4), (21.9, 35.6), (20.2, 37.8), (18.8, 40.2), (17.5, 42.5),
+    (16.3, 44.9), (15.2, 47.4), (14.2, 49.8), (13.2, 52.2), (12.2, 54.6), (16.8, 56.2),
+    (19.1, 50.6), (19.3, 50.7), (19.5, 50.8), (19.8, 50.8), (20.0, 50.9), (20.2, 51.0),
+    (20.4, 51.0), (20.6, 51.1), (20.8, 51.1), (21.0, 51.2), (21.2, 51.2), (21.4, 51.2),
+    (21.6, 51.3), (21.8, 51.3), (22.0, 51.3), (22.2, 51.3), (22.3, 51.3), (27.1, 50.9),
+    (31.4, 49.6), (35.3, 47.5), (38.8, 44.9), (42.0, 41.8), (44.7, 38.3), (47.1, 34.6),
+    (49.2, 30.8), (51.0, 27.0), (52.5, 23.2), (53.7, 19.8), (54.6, 16.7), (55.3, 14.0),
+    (55.8, 12.0), (56.1, 10.7), (56.2, 10.2), (55.5, 11.1), (54.6, 11.9), (53.4, 12.6),
+    (51.9, 13.2), (50.2, 13.7), (48.4, 14.2), (46.3, 14.7), (44.1, 15.1), (41.8, 15.5),
+    (39.4, 15.8), (36.9, 16.2), (34.4, 16.5), (31.9, 16.9), (29.5, 17.3), (27.1, 17.7),
+    (24.8, 18.1), (22.6, 18.6), (20.6, 19.4), (18.7, 20.2), (17.0, 21.2), (15.5, 22.3),
+    (14.1, 23.4), (12.9, 24.7), (11.8, 26.0), (10.8, 27.3), (10.0, 28.6), (9.3, 29.9),
+    (8.8, 31.2), (8.4, 32.4), (8.1, 33.6), (7.9, 34.7), (7.8, 35.6), (7.9, 36.5),
+    (8.0, 37.4), (8.2, 38.3), (8.5, 39.1), (8.8, 39.9), (9.2, 40.6), (9.6, 41.3),
+    (9.9, 42.0), (10.3, 42.6), (10.7, 43.1), (11.1, 43.6), (11.4, 44.0), (11.7, 44.3),
+    (11.9, 44.5), (12.0, 44.6), (12.1, 44.7), (13.7, 40.8), (15.7, 37.3), (17.9, 34.3),
+    (20.4, 31.8), (23.0, 29.6), (25.6, 27.8), (28.3, 26.3), (31.0, 25.1), (33.6, 24.2),
+    (36.0, 23.5), (38.2, 23.0), (40.2, 22.7), (41.8, 22.5), (43.0, 22.4), (43.8, 22.3),
+)
+
+
 def create_tray_icon_image(color: str):
+    """Draws a leaf glyph (see _LEAF_POLYGON_POINTS) -- green while active, yellow while paused."""
     image = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    draw.ellipse((8, 8, 56, 56), fill=color)
+    ImageDraw.Draw(image).polygon(_LEAF_POLYGON_POINTS, fill=color)
     return image
 
 
@@ -863,18 +889,18 @@ def main():
         if daemon.paused:
             daemon.paused = False
             logger.info("Resumed")
-            return
-        if daemon.power_pause_reason:
+        elif daemon.power_pause_reason:
             daemon.power_override_active = not daemon.power_override_active
             if daemon.power_override_active:
                 logger.info("Manually resumed despite power/AC pause condition")
             else:
                 logger.info("Manual override cancelled; auto-pause re-engaged")
                 daemon.restore_all()
-            return
-        daemon.paused = True
-        logger.info("Paused: restoring all managed processes to NORMAL")
-        daemon.restore_all()
+        else:
+            daemon.paused = True
+            logger.info("Paused: restoring all managed processes to NORMAL")
+            daemon.restore_all()
+        refresh_status()
 
     def on_quit(icon, item):
         logger.info("Quitting: restoring all managed processes to NORMAL")
@@ -911,9 +937,9 @@ def main():
         pystray.MenuItem(lambda item: f"Eco Processes: {daemon.get_stats()}", None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(
-            lambda item: "Pause Eco Handler" if not daemon.paused and (
+            lambda item: "Pause" if not daemon.paused and (
                 daemon.power_pause_reason is None or daemon.power_override_active
-            ) else "Resume Eco Handler",
+            ) else "Resume",
             toggle_pause,
         ),
         pystray.MenuItem(
@@ -925,11 +951,14 @@ def main():
 
     tray_icon = pystray.Icon("EcoEnforcer", icon_green, "EcoEnforcer", menu)
 
+    def refresh_status():
+        status_text = daemon.get_status_text()
+        tray_icon.icon = icon_green if status_text.startswith("Process Management Active") else icon_yellow
+        tray_icon.title = f"{status_text}\nEco Processes: {daemon.get_stats()}"
+
     def update_tooltip():
         while daemon.running:
-            status_text = daemon.get_status_text()
-            tray_icon.icon = icon_green if status_text == "Process Management Active" else icon_yellow
-            tray_icon.title = f"{status_text}\nEco Processes: {daemon.get_stats()}"
+            refresh_status()
             time.sleep(2.0)
 
     tooltip_thread = threading.Thread(target=update_tooltip, daemon=True)
