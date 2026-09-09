@@ -864,7 +864,7 @@ def acquire_single_instance_lock():
     return mutex
 
 
-def main():
+def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows session to run
     configure_logging()
 
     if sys.platform != "win32":
@@ -967,5 +967,5 @@ def main():
     tray_icon.run()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

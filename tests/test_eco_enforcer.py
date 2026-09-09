@@ -1,3 +1,4 @@
+import ctypes
 import sys
 import types
 from unittest.mock import MagicMock, patch
@@ -262,6 +263,78 @@ class TestApplyThrottleTier:
                 ee.apply_throttle_tier(1234, ee.ThrottleTier.ECO_MAX)
             mock_kernel32.CloseHandle.assert_called_once_with(42)
 
+    def test_normal_restore_caps_priority_at_lower_natural_baseline(self):
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.OpenProcess.return_value = 42
+            mock_kernel32.SetProcessInformation.return_value = True
+            baseline = {"priority": ee.IDLE_PRIORITY_CLASS, "ecoqos": False}
+            ee.apply_throttle_tier(1234, ee.ThrottleTier.NORMAL, baseline)
+            mock_kernel32.SetPriorityClass.assert_called_once_with(42, ee.IDLE_PRIORITY_CLASS)
+
+    def test_normal_restore_never_raises_above_normal_from_baseline(self):
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.OpenProcess.return_value = 42
+            mock_kernel32.SetProcessInformation.return_value = True
+            baseline = {"priority": ee.HIGH_PRIORITY_CLASS, "ecoqos": False}
+            ee.apply_throttle_tier(1234, ee.ThrottleTier.NORMAL, baseline)
+            mock_kernel32.SetPriorityClass.assert_called_once_with(42, ee.NORMAL_PRIORITY_CLASS)
+
+    def test_normal_restore_keeps_ecoqos_on_when_baseline_had_it_on(self):
+        captured = {}
+
+        def _capture_state(handle, info_class, state_ptr, size):
+            captured["state_mask"] = state_ptr._obj.StateMask
+            return True
+
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.OpenProcess.return_value = 42
+            mock_kernel32.SetProcessInformation.side_effect = _capture_state
+            baseline = {"priority": ee.NORMAL_PRIORITY_CLASS, "ecoqos": True}
+            ee.apply_throttle_tier(1234, ee.ThrottleTier.NORMAL, baseline)
+            assert captured["state_mask"] != 0
+
+    def test_normal_restore_with_no_baseline_behaves_as_before(self):
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.OpenProcess.return_value = 42
+            mock_kernel32.SetProcessInformation.return_value = True
+            ee.apply_throttle_tier(1234, ee.ThrottleTier.NORMAL, None)
+            mock_kernel32.SetPriorityClass.assert_called_once_with(42, ee.NORMAL_PRIORITY_CLASS)
+
+
+class TestCaptureNaturalBaseline:
+    def test_skips_system_and_self_pids(self):
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            assert ee.capture_natural_baseline(0) is None
+            assert ee.capture_natural_baseline(4) is None
+            mock_kernel32.OpenProcess.assert_not_called()
+
+    def test_returns_none_when_open_process_fails(self):
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.OpenProcess.return_value = 0
+            assert ee.capture_natural_baseline(1234) is None
+
+    def test_reads_priority_and_ecoqos_state(self):
+        def _fake_get_info(handle, info_class, state_ptr, size):
+            state_ptr._obj.ControlMask = ee.PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            state_ptr._obj.StateMask = ee.PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            return True
+
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.OpenProcess.return_value = 42
+            mock_kernel32.GetPriorityClass.return_value = ee.HIGH_PRIORITY_CLASS
+            mock_kernel32.GetProcessInformation.side_effect = _fake_get_info
+            result = ee.capture_natural_baseline(1234)
+            assert result == {"priority": ee.HIGH_PRIORITY_CLASS, "ecoqos": True}
+            mock_kernel32.CloseHandle.assert_called_once_with(42)
+
+    def test_ecoqos_false_when_get_process_information_fails(self):
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.OpenProcess.return_value = 42
+            mock_kernel32.GetPriorityClass.return_value = ee.NORMAL_PRIORITY_CLASS
+            mock_kernel32.GetProcessInformation.return_value = False
+            result = ee.capture_natural_baseline(1234)
+            assert result == {"priority": ee.NORMAL_PRIORITY_CLASS, "ecoqos": False}
+
 
 class TestApplyEcoQosOnly:
     def test_skips_system_and_self_pids(self):
@@ -284,6 +357,149 @@ class TestApplyEcoQosOnly:
             mock_kernel32.SetPriorityClass.assert_not_called()
             mock_kernel32.SetProcessPriorityBoost.assert_not_called()
             mock_kernel32.CloseHandle.assert_called_once_with(42)
+
+
+class TestGetDescendantPids:
+    def test_returns_recursive_children_pids(self):
+        child_a = MagicMock(pid=101)
+        child_b = MagicMock(pid=102)
+        with patch("eco_enforcer.psutil.Process") as mock_process:
+            mock_process.return_value.children.return_value = [child_a, child_b]
+            assert ee.get_descendant_pids(1) == {101, 102}
+            mock_process.return_value.children.assert_called_once_with(recursive=True)
+
+    def test_swallows_no_such_process_and_access_denied(self):
+        with patch("eco_enforcer.psutil.Process", side_effect=psutil.NoSuchProcess(1)):
+            assert ee.get_descendant_pids(1) == set()
+        with patch("eco_enforcer.psutil.Process", side_effect=psutil.AccessDenied(1)):
+            assert ee.get_descendant_pids(1) == set()
+
+
+class TestGetActivePowerPlanGuid:
+    def test_returns_none_when_call_fails(self):
+        with patch("eco_enforcer.powrprof") as mock_powrprof:
+            mock_powrprof.PowerGetActiveScheme.return_value = 1
+            assert ee.get_active_power_plan_guid() is None
+
+    def test_returns_lowercase_guid_string(self):
+        guid = ee.GUID(
+            Data1=0x381B4222, Data2=0xF694, Data3=0x41F0,
+            Data4=(ctypes.c_ubyte * 8)(0x96, 0x85, 0xFF, 0x5B, 0xB2, 0x60, 0xDF, 0x2E),
+        )
+        guid_ptr = ctypes.pointer(guid)
+        with patch("eco_enforcer.powrprof") as mock_powrprof, \
+             patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_powrprof.PowerGetActiveScheme.return_value = 0
+
+            def _fake_get_scheme(handle, guid_ptr_ref):
+                guid_ptr_ref._obj.contents = guid_ptr.contents
+                return 0
+            mock_powrprof.PowerGetActiveScheme.side_effect = _fake_get_scheme
+            result = ee.get_active_power_plan_guid()
+            assert result == "381b4222-f694-41f0-9685-ff5bb260df2e"
+            mock_kernel32.LocalFree.assert_called_once()
+
+
+class TestListPowerPlans:
+    def test_parses_powercfg_output(self):
+        stdout = (
+            "Existing Power Schemes (* Active)\n"
+            "-----------------------------------\n"
+            "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced) *\n"
+            "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)\n"
+        )
+        with patch("eco_enforcer.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=stdout)
+            plans = ee.list_power_plans()
+            assert plans == [
+                ("381b4222-f694-41f0-9685-ff5bb260df2e", "Balanced"),
+                ("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c", "High performance"),
+            ]
+
+    def test_returns_empty_list_on_subprocess_error(self):
+        with patch("eco_enforcer.subprocess.run", side_effect=OSError("missing powercfg")):
+            assert ee.list_power_plans() == []
+
+
+class TestDefaultPowerPlanEnabled:
+    def test_balanced_and_power_saver_default_enabled(self):
+        for guid in ee.BALANCED_OR_POWER_SAVER_PLAN_GUIDS:
+            assert ee.default_power_plan_enabled(guid) is True
+
+    def test_high_performance_and_custom_default_disabled(self):
+        for guid in ee.HIGH_PERFORMANCE_PLAN_GUIDS:
+            assert ee.default_power_plan_enabled(guid) is False
+        assert ee.default_power_plan_enabled("00000000-0000-0000-0000-000000000000") is False
+
+
+class TestIsOnAcWithBattery:
+    def test_returns_false_when_get_system_power_status_fails(self):
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.GetSystemPowerStatus.return_value = False
+            assert ee.is_on_ac_with_battery() is False
+
+    def test_returns_false_when_no_battery_present(self):
+        def _fake_status(status_ptr):
+            status_ptr._obj.BatteryFlag = ee.NO_SYSTEM_BATTERY_FLAG
+            status_ptr._obj.ACLineStatus = 1
+            return True
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.GetSystemPowerStatus.side_effect = _fake_status
+            assert ee.is_on_ac_with_battery() is False
+
+    def test_returns_false_when_battery_present_but_on_battery_power(self):
+        def _fake_status(status_ptr):
+            status_ptr._obj.BatteryFlag = 0
+            status_ptr._obj.ACLineStatus = 0
+            return True
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.GetSystemPowerStatus.side_effect = _fake_status
+            assert ee.is_on_ac_with_battery() is False
+
+    def test_returns_true_when_battery_present_and_on_ac(self):
+        def _fake_status(status_ptr):
+            status_ptr._obj.BatteryFlag = 0
+            status_ptr._obj.ACLineStatus = 1
+            return True
+        with patch("eco_enforcer.kernel32") as mock_kernel32:
+            mock_kernel32.GetSystemPowerStatus.side_effect = _fake_status
+            assert ee.is_on_ac_with_battery() is True
+
+
+class TestLoadSettings:
+    def test_returns_empty_dict_when_file_missing(self, tmp_path):
+        with patch("eco_enforcer.SETTINGS_FILE", tmp_path / "missing.json"):
+            assert ee.load_settings() == {}
+
+    def test_loads_persisted_settings(self, tmp_path):
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text('{"disable_on_ac": false}', encoding="utf-8")
+        with patch("eco_enforcer.SETTINGS_FILE", settings_file):
+            assert ee.load_settings() == {"disable_on_ac": False}
+
+    def test_returns_empty_dict_on_corrupt_file(self, tmp_path):
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text("{not valid", encoding="utf-8")
+        with patch("eco_enforcer.SETTINGS_FILE", settings_file):
+            assert ee.load_settings() == {}
+
+
+class TestSaveSettings:
+    def test_writes_settings_to_disk(self, tmp_path):
+        settings_file = tmp_path / "settings.json"
+        with patch("eco_enforcer.APP_DATA_DIR", tmp_path), \
+             patch("eco_enforcer.SETTINGS_FILE", settings_file):
+            ee.save_settings(False, {"guid-1": True})
+        import json
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+            "disable_on_ac": False, "power_plan_enabled": {"guid-1": True},
+        }
+
+    def test_swallows_write_errors(self, tmp_path):
+        with patch("eco_enforcer.APP_DATA_DIR", tmp_path), \
+             patch("eco_enforcer.SETTINGS_FILE", tmp_path / "settings.json"), \
+             patch("eco_enforcer.Path.write_text", side_effect=OSError("disk full")):
+            ee.save_settings(True, {})  # must not raise
 
 
 class TestEcoEnforcerDaemonEnforceStep:
