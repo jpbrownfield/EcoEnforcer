@@ -28,19 +28,23 @@ jobs:
       - name: Run tests
         run: pytest --cov=eco_enforcer --cov-report=term-missing --cov-fail-under=80
 
-  # Auto-bumps a patch version tag on every push to main; the tag push below re-triggers
-  # this workflow (matching the `tags: v*` filter), and the build job's existing
-  # tag-only release step then does the actual packaging/publishing for that new tag.
+  # Auto-bumps a patch version tag on every push to main. Note: a tag pushed using the
+  # default GITHUB_TOKEN does NOT re-trigger this workflow (GitHub suppresses that to
+  # prevent infinite loops), so the release below is created directly in this same run
+  # via the tag job's output rather than relying on a second, tag-triggered run.
   tag:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.tag_version.outputs.new_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Bump version and push tag
+        id: tag_version
         uses: mathieudutour/github-tag-action@v6.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -48,7 +52,8 @@ jobs:
           tag_prefix: v
 
   build:
-    needs: test
+    needs: [test, tag]
+    if: always() && needs.test.result == 'success'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,7 +75,8 @@ jobs:
           path: dist/EcoEnforcer.exe
 
       - name: Create GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: needs.tag.outputs.new_tag != '' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.tag.outputs.new_tag || github.ref_name }}
           files: dist/EcoEnforcer.exe
