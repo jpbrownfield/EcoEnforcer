@@ -630,6 +630,7 @@ def list_power_plans() -> list[tuple[str, str]]:
     try:
         result = subprocess.run(
             ["powercfg", "/list"], capture_output=True, text=True, timeout=5, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         return []
@@ -704,6 +705,7 @@ def _scheduled_task_exists() -> bool:
         result = subprocess.run(
             ["schtasks", "/Query", "/TN", STARTUP_TASK_NAME],
             capture_output=True, timeout=5, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         return result.returncode == 0
     except (OSError, subprocess.SubprocessError):
@@ -722,6 +724,7 @@ def _create_scheduled_task() -> None:
             ["schtasks", "/Create", "/TN", STARTUP_TASK_NAME, "/TR", _get_startup_command(),
              "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"],
             capture_output=True, timeout=5, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         logger.debug("Failed to create elevated startup task", exc_info=True)
@@ -733,6 +736,7 @@ def _delete_scheduled_task() -> None:
         subprocess.run(
             ["schtasks", "/Delete", "/TN", STARTUP_TASK_NAME, "/F"],
             capture_output=True, timeout=5, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         logger.debug("Failed to delete elevated startup task", exc_info=True)
@@ -1458,8 +1462,15 @@ def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows sess
     def make_plan_checked(guid):
         return lambda item: daemon.power_plan_enabled.get(guid, default_power_plan_enabled(guid))
 
+    # Cached rather than re-derived on every menu refresh (every 2s): is_startup_enabled()
+    # can shell out to schtasks, which is wasted work when nothing has changed since the
+    # last check/toggle.
+    startup_enabled = is_startup_enabled()
+
     def toggle_run_on_startup(icon, item):
-        set_startup_enabled(not is_startup_enabled())
+        nonlocal startup_enabled
+        startup_enabled = not startup_enabled
+        set_startup_enabled(startup_enabled)
 
     # Guards against opening a second window while one is already up.
     _excluded_window_open = threading.Event()
@@ -1532,7 +1543,7 @@ def main():  # pragma: no cover -- tray/GUI wiring; requires a real Windows sess
         ),
         pystray.MenuItem("Use With Power Plans:", pystray.Menu(*plan_menu_items)),
         pystray.MenuItem("Manage Excluded Processes...", open_excluded_processes_window),
-        pystray.MenuItem("Run on Startup", toggle_run_on_startup, checked=lambda item: is_startup_enabled()),
+        pystray.MenuItem("Run on Startup", toggle_run_on_startup, checked=lambda item: startup_enabled),
         pystray.MenuItem("Check for Updates", check_and_apply_update),
         pystray.MenuItem("Quit", on_quit)
     )
