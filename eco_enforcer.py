@@ -923,11 +923,29 @@ def apply_update(new_exe_path: Path) -> None:
         '(goto) 2>nul & del "%~f0"\r\n',
         encoding="utf-8",
     )
-    subprocess.Popen(
-        ["cmd", "/c", str(bat_path)],
-        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-        close_fds=True,
-    )
+    # CREATE_BREAKAWAY_FROM_JOB is required in addition to DETACHED_PROCESS: when EcoEnforcer
+    # itself was launched inside a Job Object (e.g. via the Task Scheduler entry used for
+    # elevated "Run on Startup"), Windows normally kills every process still in that job --
+    # including this "detached" helper -- the instant our own process exits, so the move/
+    # restart never happens. Breaking away escapes the job so the helper survives us exiting.
+    # Some restrictive job objects disallow breakaway (CreateProcess raises PermissionError);
+    # fall back to the plain flags rather than failing to spawn the helper at all.
+    try:
+        subprocess.Popen(
+            ["cmd", "/c", str(bat_path)],
+            creationflags=(
+                subprocess.DETACHED_PROCESS
+                | subprocess.CREATE_NEW_PROCESS_GROUP
+                | subprocess.CREATE_BREAKAWAY_FROM_JOB
+            ),
+            close_fds=True,
+        )
+    except OSError:
+        subprocess.Popen(
+            ["cmd", "/c", str(bat_path)],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
 
 
 # --- Daemon engine ---
