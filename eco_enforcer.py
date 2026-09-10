@@ -32,6 +32,7 @@ from tkinter import ttk
 from ctypes import wintypes
 from enum import Enum, auto
 from pathlib import Path
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
 from PIL import Image, ImageDraw, ImageTk
@@ -900,6 +901,9 @@ def _verify_update_signature(exe_path: Path) -> bool:
     return bool(thumbprint) and thumbprint.upper() == UPDATE_SIGNING_THUMBPRINT.upper()
 
 
+UPDATE_TASK_NAME = "EcoEnforcerUpdate"
+
+
 def apply_update(new_exe_path: Path) -> None:
     """Launches a detached helper .bat that waits for this process to exit, replaces the
     running executable (wherever it's installed) with new_exe_path, relaunches it, then
@@ -910,26 +914,59 @@ def apply_update(new_exe_path: Path) -> None:
     update_dir = APP_DATA_DIR / "update"
     update_dir.mkdir(parents=True, exist_ok=True)
     bat_path = update_dir / "apply_update.bat"
+    log_path = update_dir / "apply_update.log"
+    # Every step logs to apply_update.log: this helper runs fully detached from us with no
+    # console, so if a step silently fails (move access-denied, antivirus lock, etc.) there's
+    # otherwise no way to see why -- the log is the only diagnostic trail available afterward.
     bat_path.write_text(
         "@echo off\r\n"
+        f'set "LOG={log_path}"\r\n'
+        f'echo [%date% %time%] waiting for pid {pid} to exit >>"%LOG%"\r\n'
         ":wait\r\n"
         f'tasklist /fi "PID eq {pid}" | findstr /i "{pid}" >nul\r\n'
         "if %errorlevel%==0 (\r\n"
         "  timeout /t 1 /nobreak >nul\r\n"
         "  goto wait\r\n"
         ")\r\n"
-        f'move /y "{new_exe_path}" "{current_exe}" >nul\r\n'
+        f'echo [%date% %time%] pid {pid} exited, moving new exe into place >>"%LOG%"\r\n'
+        f'move /y "{new_exe_path}" "{current_exe}" >>"%LOG%" 2>&1\r\n'
+        'echo [%date% %time%] move errorlevel=%errorlevel% >>"%LOG%"\r\n'
         f'start "" "{current_exe}"\r\n'
+        'echo [%date% %time%] start errorlevel=%errorlevel% >>"%LOG%"\r\n'
+        f'schtasks /Delete /TN "{UPDATE_TASK_NAME}" /F >>"%LOG%" 2>&1\r\n'
         '(goto) 2>nul & del "%~f0"\r\n',
         encoding="utf-8",
     )
-    # CREATE_BREAKAWAY_FROM_JOB is required in addition to DETACHED_PROCESS: when EcoEnforcer
-    # itself was launched inside a Job Object (e.g. via the Task Scheduler entry used for
-    # elevated "Run on Startup"), Windows normally kills every process still in that job --
-    # including this "detached" helper -- the instant our own process exits, so the move/
-    # restart never happens. Breaking away escapes the job so the helper survives us exiting.
-    # Some restrictive job objects disallow breakaway (CreateProcess raises PermissionError);
-    # fall back to the plain flags rather than failing to spawn the helper at all.
+
+    # Launched via a one-shot Task Scheduler task rather than a direct child process, since
+    # a direct child (even DETACHED_PROCESS + CREATE_BREAKAWAY_FROM_JOB) can still be torn
+    # down when our own process exits if we're inside a Job Object that doesn't permit
+    # breakaway. Task Scheduler's service spawns the task as a fresh, independent process,
+    # so it isn't affected by whatever job (if any) our own process happens to be in. Falls
+    # back to a direct detached Popen (best effort) if Task Scheduler itself can't be used.
+    start_time = (datetime.now() + timedelta(minutes=2)).strftime("%H:%M")
+    try:
+        subprocess.run(
+            ["schtasks", "/Create", "/TN", UPDATE_TASK_NAME, "/TR", f'cmd /c "{bat_path}"',
+             "/SC", "ONCE", "/ST", start_time, "/F"],
+            capture_output=True, timeout=5, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        result = subprocess.run(
+            ["schtasks", "/Run", "/TN", UPDATE_TASK_NAME],
+            capture_output=True, timeout=5, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0:
+            return
+        subprocess.run(
+            ["schtasks", "/Delete", "/TN", UPDATE_TASK_NAME, "/F"],
+            capture_output=True, timeout=5, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.debug("Failed to launch update helper via Task Scheduler", exc_info=True)
+
     try:
         subprocess.Popen(
             ["cmd", "/c", str(bat_path)],

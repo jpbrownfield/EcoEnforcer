@@ -669,13 +669,26 @@ class TestVerifyUpdateSignature:
 
 
 class TestApplyUpdate:
-    def test_writes_bat_and_launches_helper(self, tmp_path):
+    def test_writes_bat_and_launches_via_scheduled_task(self, tmp_path):
         with patch("eco_enforcer.APP_DATA_DIR", tmp_path), \
-             patch("eco_enforcer.subprocess.Popen") as mock_popen:
+             patch("eco_enforcer.subprocess.Popen") as mock_popen, \
+             patch("eco_enforcer.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
             ee.apply_update(tmp_path / "EcoEnforcer.new.exe")
             bat_path = tmp_path / "update" / "apply_update.bat"
             assert bat_path.exists()
-            assert "move /y" in bat_path.read_text(encoding="utf-8")
+            bat_text = bat_path.read_text(encoding="utf-8")
+            assert "move /y" in bat_text
+            assert f'schtasks /Delete /TN "{ee.UPDATE_TASK_NAME}"' in bat_text
+            create_call, run_call = mock_run.call_args_list
+            assert create_call.args[0][:3] == ["schtasks", "/Create", "/TN"]
+            assert run_call.args[0] == ["schtasks", "/Run", "/TN", ee.UPDATE_TASK_NAME]
+            mock_popen.assert_not_called()
+
+    def test_falls_back_to_direct_popen_when_scheduled_task_fails(self, tmp_path):
+        with patch("eco_enforcer.APP_DATA_DIR", tmp_path), \
+             patch("eco_enforcer.subprocess.Popen") as mock_popen, \
+             patch("eco_enforcer.subprocess.run", return_value=MagicMock(returncode=1)):
+            ee.apply_update(tmp_path / "EcoEnforcer.new.exe")
             mock_popen.assert_called_once()
 
 
