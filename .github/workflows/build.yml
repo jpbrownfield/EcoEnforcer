@@ -86,8 +86,11 @@ jobs:
           echo "${TAG#v}" > version.txt
           cat version.txt
 
+      - name: Generate app icon
+        run: python generate_icon.py
+
       - name: Build executable
-        run: pyinstaller --onefile --noconsole --name EcoEnforcer --add-data "version.txt;." eco_enforcer.py
+        run: pyinstaller --onefile --noconsole --name EcoEnforcer --icon assets\icon.ico --add-data "version.txt;." eco_enforcer.py
 
       - name: Sign executable
         if: env.CODE_SIGN_PFX_BASE64 != ''

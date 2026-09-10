@@ -37,8 +37,8 @@ Priority class and EcoQoS are plain process attributes — Windows has no way
 to "lock" them, so the process itself, another admin tool, or a user action
 (e.g. Task Manager) can silently overwrite them at any time. To defend
 against that, EcoEnforcer re-applies the target state on every check rather
-than only when its own bookkeeping says the tier changed: every ~1.5s for
-windowed apps, and on every background scan pass (~15s) for EcoQoS-only
+than only when its own bookkeeping says the tier changed: every ~3s for
+windowed apps, and on every background scan pass (~30s) for EcoQoS-only
 processes. The known-window set is small, so the extra syscalls are
 negligible and don't meaningfully offset the power savings.
 

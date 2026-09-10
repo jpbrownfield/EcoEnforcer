@@ -1021,7 +1021,7 @@ class TestEcoEnforcerDaemonMisc:
             daemon.run()
             mock_comtypes.CoInitialize.assert_called_once()
             mock_comtypes.CoUninitialize.assert_called_once()
-            mock_sleep.assert_called_once_with(1.5)
+            mock_sleep.assert_called_once_with(ee.ENFORCE_LOOP_INTERVAL_SECONDS)
         assert call_count["n"] == 1
 
 

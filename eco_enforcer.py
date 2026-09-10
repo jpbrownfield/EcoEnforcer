@@ -187,15 +187,19 @@ def configure_logging() -> None:
     APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-
     file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     file_handler.setFormatter(formatter)
 
     logger.setLevel(logging.INFO)
-    logger.addHandler(console_handler)
     logger.addHandler(file_handler)
+
+    # The --noconsole build has no real console: PyInstaller's bootloader sets sys.stdout/
+    # stderr to None in that case, so a StreamHandler would raise (silently, but not for
+    # free) on every single log call. Only attach it when a real stream exists to write to.
+    if sys.stderr is not None:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
 
 # Shell/system processes that should never be throttled. Widened beyond the tray-app
@@ -226,8 +230,13 @@ BACKGROUND_CPU_THRESHOLD_PERCENT = 5.0
 BACKGROUND_LOW_USAGE_CYCLES = 3
 ECO_QOS_ONLY_TAG = "ECO_QOS_ONLY"
 
+# How often the daemon's main loop wakes up to re-check foreground/audio state and
+# reassert priority/EcoQoS. Also governs audio-transition latency (a process can take up
+# to this long to be recognized as having started/stopped playing audio).
+ENFORCE_LOOP_INTERVAL_SECONDS = 3.0
+
 # Scanning every process on the system costs CPU too, so it runs far less often than
-# the windowed-app enforcement loop (every Nth enforce_step cycle, ~15s at the 1.5s poll rate).
+# the windowed-app enforcement loop (every Nth enforce_step cycle, ~30s at the 3s poll rate).
 BACKGROUND_SCAN_EVERY_N_CYCLES = 10
 
 # If something keeps fighting us and resetting the same non-NORMAL tier, we keep
@@ -605,6 +614,40 @@ def get_descendant_pids(pid: int) -> set[int]:
         return set()
 
 
+def get_descendants_bulk(owner_pids: set[int]) -> dict[int, set[int]]:
+    """Returns {owner_pid: descendant pids} for many owners in a single process scan.
+
+    psutil.Process.children(recursive=True) takes its own system-wide process snapshot
+    on every call, so calling get_descendant_pids() once per owner_pid (as enforce_step
+    used to) re-scans every process on the machine once per tracked window -- wasteful
+    when several windowed apps are visible at once. This builds one pid->children map
+    from a single psutil.process_iter() pass and reuses it for every owner.
+    """
+    if not owner_pids:
+        return {}
+    children_of: dict[int, set[int]] = {}
+    try:
+        for proc in psutil.process_iter(['pid', 'ppid']):
+            ppid = proc.info['ppid']
+            if ppid is not None:
+                children_of.setdefault(ppid, set()).add(proc.info['pid'])
+    except OSError:
+        return {}
+
+    def descendants(root: int) -> set[int]:
+        result: set[int] = set()
+        stack = list(children_of.get(root, ()))
+        while stack:
+            child_pid = stack.pop()
+            if child_pid in result:
+                continue
+            result.add(child_pid)
+            stack.extend(children_of.get(child_pid, ()))
+        return result
+
+    return {owner: descendants(owner) for owner in owner_pids}
+
+
 def get_active_power_plan_guid() -> str | None:
     """Returns the lowercase GUID of the currently active Windows power plan, or None."""
     guid_ptr = ctypes.POINTER(GUID)()
@@ -946,7 +989,7 @@ class EcoEnforcerDaemon:
                 elif self._was_active:
                     self.restore_all()
                 self._was_active = active
-                time.sleep(1.5)
+                time.sleep(ENFORCE_LOOP_INTERVAL_SECONDS)
         finally:
             comtypes.CoUninitialize()
 
@@ -1002,6 +1045,10 @@ class EcoEnforcerDaemon:
         visible_pids = get_visible_window_pids()
 
         with self._lock:
+            # Snapshotted so persist_managed_state (a disk write) only runs when this
+            # cycle actually changed something, instead of unconditionally every cycle.
+            state_before = (dict(self.managed_pids), frozenset(self.eco_qos_pids))
+
             self.known_pids |= visible_pids - {os.getpid()}
 
             # Stop tracking any pid that no longer exists, wherever it came from
@@ -1024,8 +1071,9 @@ class EcoEnforcerDaemon:
             # multi-process app's helper/renderer children would otherwise stay stuck at
             # whatever tier they last had. Govern them the same as their tracked ancestor.
             descendant_targets: dict[int, ThrottleTier] = {}
+            descendants_by_owner = get_descendants_bulk(set(target_states.keys()))
             for owner_pid, tier in target_states.items():
-                for child_pid in get_descendant_pids(owner_pid):
+                for child_pid in descendants_by_owner.get(owner_pid, ()):
                     if child_pid in self.known_pids or is_protected(child_pid, self.excluded_processes):
                         continue
                     descendant_targets.setdefault(child_pid, tier)
@@ -1074,7 +1122,10 @@ class EcoEnforcerDaemon:
             self._enforce_cycle_count += 1
             if self._enforce_cycle_count % BACKGROUND_SCAN_EVERY_N_CYCLES == 0:
                 self._manage_background_processes()
-            persist_managed_state(self.managed_pids, self.eco_qos_pids)
+
+            state_after = (self.managed_pids, frozenset(self.eco_qos_pids))
+            if state_after != state_before:
+                persist_managed_state(self.managed_pids, self.eco_qos_pids)
 
     def _manage_background_processes(self):
         """EcoQoS-only pass over processes with no known window (never touches priority)."""
@@ -1211,10 +1262,12 @@ _LEAF_POLYGON_POINTS = (
 )
 
 
-def create_tray_icon_image(color: str):
+def create_tray_icon_image(color: str, size: int = 64):
     """Draws a leaf glyph (see _LEAF_POLYGON_POINTS) -- green while active, yellow while paused."""
-    image = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
-    ImageDraw.Draw(image).polygon(_LEAF_POLYGON_POINTS, fill=color)
+    scale = size / 64
+    points = tuple((x * scale, y * scale) for x, y in _LEAF_POLYGON_POINTS)
+    image = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    ImageDraw.Draw(image).polygon(points, fill=color)
     return image
 
 

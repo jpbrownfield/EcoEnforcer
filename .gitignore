@@ -8,3 +8,4 @@ dist/
 *.spec
 .venv/
 venv/
+assets/icon.ico
